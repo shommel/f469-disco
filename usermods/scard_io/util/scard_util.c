@@ -13,7 +13,7 @@
 #include "uart.h"
 #include "t1_protocol.h"
 
-USART_TypeDef* scard_get_usart_handle(int usart_id) {
+USART_TypeDef* scard_get_usart_handle(mp_int_t usart_id) {
   switch(usart_id) {
   #ifdef USART0
     case 0:
