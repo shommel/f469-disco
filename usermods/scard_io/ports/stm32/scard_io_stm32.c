@@ -5,6 +5,7 @@
  * @copyright  Copyright 2020 Crypto Advance GmbH. All rights reserved.
  */
 
+#include <stdio.h> // TODO: remove
 #include "py/obj.h"
 #include "py/runtime.h"
 #include "py/builtin.h"
@@ -19,6 +20,11 @@
 
 /// Maximum number of interface instances = maximum number of USARTs
 #define MAX_INSTANCES                   (11U)
+/// Length of receive buffer
+#define RX_BUF_LEN                      (270)
+
+/// Type information for smart card interface instance
+const mp_obj_type_t scard_inst_type;
 
 /// Type of key used for callback table (handle of smart card driver)
 typedef SMARTCARD_HandleTypeDef* callback_key_t;
@@ -247,25 +253,83 @@ static bool init_pins(mp_obj_t io_pin, mp_obj_t clk_pin, uint8_t usart_id) {
   return ok;
 }
 
+/**
+ * Create a machine.UART object and sets callback
+ *
+ * @param handle     smart card interface handle
+ * @param uart_id    identifier of UART
+ * @param callback   callable object scheduled on receive event
+ * @return           machine.UART object
+ */
+static mp_obj_t create_machine_uart(mp_int_t usart_id, mp_obj_t callback) {
+  // Call constructor of machine.UART class
+  mp_obj_t args_new[] = {
+    // Positional arguments
+    MP_OBJ_NEW_SMALL_INT(usart_id), // id
+    MP_OBJ_NEW_SMALL_INT(9600),     // baudrate
+    MP_OBJ_NEW_SMALL_INT(8),        // bits
+    // Keyword arguments
+    MP_OBJ_NEW_QSTR(MP_QSTR_timeout), MP_OBJ_NEW_SMALL_INT(0),
+    MP_OBJ_NEW_QSTR(MP_QSTR_timeout_char), MP_OBJ_NEW_SMALL_INT(0),
+    MP_OBJ_NEW_QSTR(MP_QSTR_rxbuf), MP_OBJ_NEW_SMALL_INT(RX_BUF_LEN)
+  };
+  mp_obj_t uart = pyb_uart_type.make_new(&pyb_uart_type, 3, 3, args_new);
+
+  // Call machine.UART.irq()
+  mp_obj_t args_irq[] = {
+      callback,                             // handler
+      MP_OBJ_NEW_SMALL_INT(UART_FLAG_IDLE), // trigger
+      mp_const_false,                       // hard
+  };
+  (void)mp_call_function_n_kw(mp_load_attr(uart, MP_QSTR_irq), 3, 0, args_irq);
+
+  return uart;
+}
+
 scard_handle_t scard_interface_init(mp_const_obj_t iface_id, mp_obj_t io_pin,
-                                    mp_obj_t clk_pin, mp_obj_t callback) {
-  scard_handle_t handle = NULL;
+                                    mp_obj_t clk_pin,
+                                    scard_cb_data_rx_t cb_data_rx,
+                                    mp_obj_t cb_self) {
+  scard_handle_t self = NULL;
+
+  if(scard_class_debug) {
+    mp_printf(&mp_plat_print, "\r\nInitializing scard_interface"); // TODO: remove
+  }
 
   if(mp_obj_is_int(iface_id)) {
     mp_int_t usart_id = mp_obj_get_int(iface_id);
     const scard_usart_dsc_t* p_usard_dsc = find_descriptor(usart_id);
     if(p_usard_dsc) {
-      handle = m_new0(scard_inst_t, 1);
-      handle->p_usard_dsc = p_usard_dsc;
-      if(!init_smartcard(&handle->sc_handle, p_usard_dsc->handle)) {
+      // Create a new interface instance
+      self = m_new0(scard_inst_t, 1);
+      self->base.type = &scard_inst_type;
+      self->p_usard_dsc = p_usard_dsc;
+
+      // Create machine.UART and set callback
+      mp_obj_t uart_cb = mp_load_attr(self, MP_QSTR_uart_callback);
+      self->machine_uart_obj = create_machine_uart(usart_id, uart_cb);
+      // Get pointer to underlying system object to use C API instead of Python.
+      // Yes, this is a horrible abstraction leak, made intentionally for the
+      // sake of performance.
+      self->uart_obj = MP_STATE_PORT(pyb_uart_obj_all)[usart_id - 1];
+      if(self->uart_obj == NULL) {
+        scard_raise_internal_error("failed to obtain system UART object");
+      }
+
+      // Overwrite USART registers with settings for smart card
+      if(!init_smartcard(&self->sc_handle, p_usard_dsc->handle)) {
         scard_raise_hw_error("failed to initialize USART in smart card mode");
       }
+
+      // Initialize pins
       if(!init_pins(io_pin, clk_pin, p_usard_dsc->id)) {
         scard_raise_hw_error("failed to configure USART pins");
       }
-      if(!add_callback(&handle->sc_handle, callback)) {
-        mp_raise_ValueError("USART already used");
-      }
+
+      // Save callback and self parameter
+      self->cb_data_rx = cb_data_rx;
+      self->cb_self = cb_self;
+
     } else {
       mp_raise_ValueError("USART does not exists");
     }
@@ -273,12 +337,13 @@ scard_handle_t scard_interface_init(mp_const_obj_t iface_id, mp_obj_t io_pin,
     mp_raise_TypeError("usart_id is not an integer");
   }
 
-  return handle;
+  return self;
 }
 
 void scard_interface_deinit(scard_handle_t handle) {
   // TODO: abort transfer
   // TODO: disable USART interrupt
+  // TODO: deinit machine.UART
   HAL_SMARTCARD_DeInit(&handle->sc_handle);
   remove_callback(&handle->sc_handle);
   m_del(scard_inst_t, handle, 1);
@@ -335,3 +400,25 @@ void HAL_SMARTCARD_RxCpltCallback(SMARTCARD_HandleTypeDef *hsc) {
   UNUSED(hsc);
   // TODO: implement
 }
+
+STATIC mp_obj_t uart_callback(mp_obj_t self_in) {
+  scard_inst_t* self = (scard_inst_t*)self_in;
+
+  while(uart_rx_any(self->uart_obj)) {
+    // TODO: remove
+      mp_printf(&mp_plat_print, "%c", uart_rx_char(self->uart_obj));
+  }
+}
+
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(uart_callback_obj, uart_callback);
+
+STATIC const mp_rom_map_elem_t scard_inst_locals_dict_table[] = {
+  // Instance methods
+  { MP_ROM_QSTR(MP_QSTR_uart_callback), MP_ROM_PTR(&uart_callback_obj) },
+};
+STATIC MP_DEFINE_CONST_DICT(scard_inst_locals_dict, scard_inst_locals_dict_table);
+
+const mp_obj_type_t scard_inst_type = {
+  { &mp_type_type },
+  .locals_dict = (void*)&scard_inst_locals_dict,
+};

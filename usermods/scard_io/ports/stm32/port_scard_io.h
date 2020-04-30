@@ -39,8 +39,13 @@ typedef struct scard_usart_dsc_ {
 
 /// Smart card interface instance and handle
 typedef struct scard_inst_ {
+  mp_obj_base_t base;                    ///< Pointer to type of base class
   SMARTCARD_HandleTypeDef sc_handle;     ///< HAL Smartcard handle structure
   const scard_usart_dsc_t* p_usard_dsc;  ///< Pointer to USART descriptor
+  mp_obj_t machine_uart_obj;             ///< machine.UART object used for IO
+  pyb_uart_obj_t* uart_obj;              ///< Underlying UART object
+  scard_cb_data_rx_t cb_data_rx;         ///< Callback for received data
+  mp_obj_t cb_self;                      ///< Self parameter for callback(s)
 } scard_inst_t, *scard_handle_t;
 
 /// Pin descriptor
@@ -66,16 +71,5 @@ static inline scard_pin_state_t scard_pin_read(scard_pin_dsc_t* p_pin) {
   uint32_t state = mp_hal_pin_read(p_pin->pin) ? 1U : 0U;
   return (scard_pin_state_t)(state ^ p_pin->invert);
 }
-
-/**
- * Creates a new pin
- * @param user_obj   user-provided pin object
- * @param polarity   polarity: 0 - active low, 1 - active high
- * @param output     if true pin is configured as output
- * @param def_state  default state for an output pin
- * @return           pin descriptor
- */
-extern scard_pin_dsc_t scard_pin(mp_obj_t user_obj, mp_int_t polarity,
-                                 bool output, scard_pin_state_t def_state);
 
 #endif // SCARD_IO_PORT_H

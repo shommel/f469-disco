@@ -5,6 +5,7 @@
  * @copyright  Copyright 2020 Crypto Advance GmbH. All rights reserved.
  */
 
+#include <stdio.h>
 #include "py/obj.h"
 #include "py/runtime.h"
 #include "py/builtin.h"
@@ -45,14 +46,11 @@ typedef struct connection_obj_ {
   mp_obj_t timer;                 ///< Timer object
   mp_uint_t prev_ticks_ms;        ///< Previous value of millisecond ticks
   proto_handle_t proto_handle;    ///< Handle to used protocol
+  bool card_present;              ///< Card presence flag
 } connection_obj_t;
 
 #if defined(DEBUG) && defined(SCARD_DEBUG)
-  /// Flag variable enabling debug output
-  STATIC bool scard_class_debug = SCARD_DEBUG ? true : false;
-#else
-  /// Disables debug output forever
-  #define scard_class_debug (0)
+  bool scard_class_debug = SCARD_DEBUG ? true : false;
 #endif
 
 /// Type information for _scard.connection class
@@ -102,6 +100,34 @@ STATIC mp_obj_t connection_call(mp_obj_t self_in, size_t n_args, size_t n_kw,
     mp_uint_t ticks_ms = mp_hal_ticks_ms();
     connection_timer_task(self, ticks_diff(ticks_ms, self->prev_ticks_ms));
     self->prev_ticks_ms = ticks_ms;
+  }
+
+  if(scard_pin_read(&self->pres_pin)) {
+    __asm(" nop");
+    if(!self->card_present) {
+      self->card_present = true;
+      #if 0 // TODO: remove
+      scard_pin_write(&self->rst_pin, ACT);
+      scard_pin_write(&self->pwr_pin, ACT);
+      mp_hal_delay_ms(50);
+      scard_pin_write(&self->rst_pin, INACT);
+      #endif
+      if(scard_class_debug) {
+        mp_printf(&mp_plat_print, "\r\nCard inserted");
+      }
+    }
+  } else {
+    __asm(" nop");
+    if(self->card_present) {
+      self->card_present = false;
+      #if 0 // TODO: remove
+      scard_pin_write(&self->rst_pin, ACT);
+      scard_pin_write(&self->pwr_pin, INACT);
+      #endif
+      if(scard_class_debug) {
+        mp_printf(&mp_plat_print, "\r\nCard removed");
+      }
+    }
   }
 
   return mp_const_none;
@@ -160,6 +186,18 @@ static void t1_cb_handle_event(t1_ev_code_t ev_code, const void* ev_prm,
   connection_obj_t* self = (connection_obj_t*)p_user_prm;
   (void)self;
   // TODO: implement
+}
+
+/**
+ * Callback function handling received data
+ *
+ * @param self_in  instance of a class which method is called
+ * @param buf      buffer containing received data
+ * @param len      length of data block in bytes
+ */
+static void cb_data_rx(mp_obj_t self_in, const uint8_t* buf, size_t len) {
+  connection_obj_t* self = (connection_obj_t*)self_in;
+  (void)self;
 }
 
 /**
@@ -233,7 +271,7 @@ static void scard_connection_init(connection_obj_t* self, size_t n_args,
     { MP_QSTR_handler,   MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
     { MP_QSTR_protocol,  MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = T1_protocol} },
     { MP_QSTR_rst_pol,   MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = 0}           },
-    { MP_QSTR_pres_pol,  MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = 0}           },
+    { MP_QSTR_pres_pol,  MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = 1}           },
     { MP_QSTR_pwr_pol,   MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = 0}           },
     { MP_QSTR_timer_id,  MP_ARG_KW_ONLY  | MP_ARG_OBJ, {.u_obj = def_timer_id}}
   };
@@ -245,9 +283,8 @@ static void scard_connection_init(connection_obj_t* self, size_t n_args,
                     allowed_args, (mp_arg_val_t*)&args );
 
   // Initialize smart card hardware interface
-  mp_obj_t callback = mp_load_attr(self, MP_QSTR__io_callback);
   self->sc_handle = scard_interface_init(args.usart_id.u_obj, args.io_pin.u_obj,
-                                         args.clk_pin.u_obj, callback);
+                                         args.clk_pin.u_obj, cb_data_rx, self);
   if(!self->sc_handle) {
     scard_raise_hw_error("failed to initialize USART in smart card mode");
   }
@@ -287,7 +324,7 @@ static void scard_connection_init(connection_obj_t* self, size_t n_args,
  * Constructor
  * .. class:: connection( usart_id, io_pin, clk_pin, rst_pin, pres_pin,
  *                        pwr_pin, handler, protocol=_scard_io.T1_protocol,
- *                        rst_pol=0, pres_pol=0, pwr_pol=0, timer_id=-1 )
+ *                        rst_pol=0, pres_pol=1, pwr_pol=0, timer_id=-1 )
  *
  *  Constructs a connection object with given parameters:
  *
@@ -326,6 +363,10 @@ STATIC mp_obj_t connection_make_new(const mp_obj_type_t* type, size_t n_args,
     ARG_n_min // Minimal number of arguments
   };
   mp_arg_check_num(n_args, n_kw, ARG_n_min, MP_OBJ_FUN_ARGS_MAX, true);
+
+  if(scard_class_debug) {
+    mp_printf(&mp_plat_print, "\r\nNew smart card connection");
+  }
 
   // Create a new object
   connection_obj_t* self = NULL;
